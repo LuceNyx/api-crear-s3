@@ -1,0 +1,171 @@
+comentario.py
+import boto3
+import uuid
+import os
+import json
+from datetime import datetime, timezone
+
+dynamodb = boto3.resource('dynamodb')
+s3 = boto3.client('s3')
+
+def _resp(status, payload):
+    return {
+        "statusCode": status,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",          
+            "Access-Control-Allow-Headers": "Content-Type,Authorization",
+            "Access-Control-Allow-Methods": "OPTIONS,POST"
+        },
+        "body": json.dumps(payload, ensure_ascii=False)
+    }
+
+def _safe_body(event):
+    body_raw = event.get("body")
+    if isinstance(body_raw, dict):
+        return body_raw
+    if isinstance(body_raw, str):
+        try:
+            return json.loads(body_raw)
+        except Exception:
+            return {}
+    return {}
+
+def lambda_handler(event, context):
+    try:
+        body = _safe_body(event)
+        tenant_id = body.get("tenant_id")
+        texto = body.get("texto")
+
+        if not tenant_id or not isinstance(tenant_id, str):
+            return _resp(400, {"message": "Falta o inválido 'tenant_id'."})
+        if not texto or not isinstance(texto, str):
+            return _resp(400, {"message": "Falta o inválido 'texto'."})
+
+        table_name = os.environ["TABLE_NAME"]
+        bucket_name = os.environ["BUCKET_NAME"]
+
+        now = datetime.now(timezone.utc)
+        uuidv1 = str(uuid.uuid1())
+        comentario = {
+            "tenant_id": tenant_id,
+            "uuid": uuidv1,
+            "detalle": {"texto": texto},
+            "timestamp_iso": now.isoformat()
+        }
+
+        ddb_ok = None
+        if table_name:
+            table = dynamodb.Table(table_name)
+            table.put_item(Item=comentario)
+            ddb_ok = True
+  
+        s3_key = f"{tenant_id}/{now:%Y/%m/%d}/{uuidv1}.json"
+        s3.put_object(
+            Bucket=bucket_name,
+            Key=s3_key,
+            Body=json.dumps(comentario, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json",
+            Metadata={
+                "tenant_id": tenant_id,
+                "uuid": uuidv1,
+                "timestamp": comentario["timestamp_iso"]
+            }
+        )
+
+        return _resp(200, {
+            "message": "Comentario almacenado.",
+            "s3_bucket": bucket_name,
+            "s3_key": s3_key,
+            "dynamodb": "ok" if ddb_ok else "skipped"
+        })
+
+    except Exception as e:
+
+        print("ERROR:", repr(e))
+        return _resp(500, {"message": "Error interno", "detail": str(e)})
+serverless.yml:
+org: lucenyx
+service: api-crear-s3
+
+provider:
+  name: aws
+  runtime: python3.13
+  memorySize: 1024
+  timeout: 20
+  iam:
+    role: arn:aws:iam::542450769088:role/LabRole
+  environment:
+    TABLE_NAME: ${sls:stage}-t_comentarios
+    BUCKET_NAME: ${self:custom.ingestBucketName}
+
+functions:
+  crear:
+    handler: comentario.lambda_handler
+    events:
+      - http:
+          path: /comentario/crear
+          method: post
+          cors: true
+
+custom:
+
+  ingestBucketName: ${sls:stage}-comentarios-ingesta-${aws:accountId}-${aws:region}
+
+resources:
+  Resources:
+    TablaComentarios:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.TABLE_NAME}
+        AttributeDefinitions:
+          - AttributeName: tenant_id
+            AttributeType: S
+          - AttributeName: uuid
+            AttributeType: S
+        KeySchema:
+          - AttributeName: tenant_id
+            KeyType: HASH
+          - AttributeName: uuid
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+
+    BucketIngesta:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.ingestBucketName}
+        LifecycleConfiguration:
+          Rules:
+            - Id: DeleteOldFiles
+              Status: Enabled
+              ExpirationInDays: 90
+        VersioningConfiguration:
+          Status: Enabled
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+
+
+    BucketIngestaPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: ${self:custom.ingestBucketName}
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Sid: DenyInsecureTransport
+              Effect: Deny
+              Principal: "*"
+              Action: "s3:*"
+              Resource:
+                - arn:aws:s3:::${self:custom.ingestBucketName}
+                - arn:aws:s3:::${self:custom.ingestBucketName}/*
+              Condition:
+                Bool:
+                  aws:SecureTransport: "false"
